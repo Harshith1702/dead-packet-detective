@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dead Packet Detective</title>
+<style>
+/* Two faces by function: mono is the machine record, sans is the analyst's prose. One accent, used only for faults. */
+:root{--bg:#1a1917;--ink:#d8d0bf;--dim:#8b8478;--rule:#37332c;--fault:#c4584d;
+  --mono:"Cascadia Mono",Consolas,"DejaVu Sans Mono",monospace;--sans:Bahnschrift,"Segoe UI","DejaVu Sans Condensed",sans-serif;
+  --c1:6.6rem;--c2:5.2rem;--c3:5.8rem;--g:12px}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.5 var(--sans)}
+.page{max-width:1100px;margin-left:clamp(16px,6vw,96px);padding:28px 24px 64px 0}
+section{display:grid;grid-template-columns:9.5rem minmax(0,1fr);gap:0 24px;border-top:1px solid var(--rule);padding:14px 0 22px}
+section.top{border-top:0}
+h1{font-size:15px;font-weight:700;line-height:1.25;margin:0}
+h2{font:inherit;color:var(--dim);margin:0}
+.dim{color:var(--dim)}
+.bad{color:var(--fault)}
+:focus-visible{outline:2px solid var(--ink);outline-offset:2px}
+form{display:flex;flex-wrap:wrap;gap:10px 20px;align-items:flex-end}
+label{display:flex;flex-direction:column;font-size:13px;color:var(--dim)}
+input{font:14px var(--mono);color:var(--ink);background:transparent;border:0;border-bottom:1px solid var(--dim);border-radius:0;padding:4px 0;width:16rem}
+#p{width:9rem}
+button,.btn{font:700 14px var(--sans);background:var(--ink);color:var(--bg);border:1px solid var(--ink);border-radius:0;padding:5px 14px;cursor:pointer;text-decoration:none}
+button:disabled{opacity:.45;cursor:progress}
+button.quiet{background:transparent;color:var(--ink)}
+#err{flex-basis:100%;margin:0;min-height:0}
+dl{display:grid;grid-template-columns:5.5rem minmax(0,1fr);gap:1px 16px;margin:16px 0 0;font:13px/1.5 var(--mono)}
+dt{color:var(--dim)}dd{margin:0}
+.row{border-bottom:1px solid var(--rule)}
+.row:first-child{border-top:1px solid var(--rule)}
+summary{list-style:none;cursor:pointer;display:grid;grid-template-columns:var(--c1) var(--c2) var(--c3) minmax(0,1fr) 2.6rem;gap:0 var(--g);padding:5px 0;font:13px/1.55 var(--mono)}
+summary::-webkit-details-marker{display:none}
+.tog{text-align:right;color:var(--dim)}
+.tog::after{content:"raw"}details[open] .tog::after{content:"hide"}
+summary:hover .tog{color:var(--ink)}
+.raw{margin:0 0 8px calc(var(--c1) + var(--c2) + var(--c3) + 3 * var(--g));padding:2px 0 2px 12px;border-left:1px solid var(--dim);color:var(--dim);font:12.5px/1.5 var(--mono);white-space:pre-wrap;word-break:break-all}
+.grp{display:grid;grid-template-columns:6.4rem minmax(0,1fr);gap:0 16px;margin-bottom:14px}
+.grp .k{color:var(--dim);font-size:13px;padding-top:1px}
+.grp p{margin:0 0 6px}
+.grp.hypothesis p{font-style:italic}
+.lim summary{display:block;font:13px var(--sans);color:var(--dim)}
+.lim p{margin:6px 0 0;font-size:13px;color:var(--dim);max-width:70ch}
+.report{white-space:pre-wrap;font:12.5px/1.55 var(--mono);border:1px solid var(--rule);padding:10px 12px;margin:12px 0 0;overflow-x:auto}
+@media(max-width:760px){section{grid-template-columns:1fr}h1,h2{margin-bottom:8px}
+  summary{grid-template-columns:var(--c1) 1fr 2.6rem}summary .pr{display:none}summary .tx{grid-column:1/-1;order:5}
+  .raw{margin-left:0}.grp{grid-template-columns:1fr}input{width:100%}}
+</style>
+</head>
+<body>
+<div class="page">
+  <section class="top">
+    <h1>Dead Packet<br>Detective</h1>
+    <div>
+      <form id="f">
+        <label>Target<input id="t" placeholder="host.example or 192.0.2.7" required autofocus spellcheck="false" autocomplete="off"></label>
+        <label>TCP ports<input id="p" placeholder="443, 80" spellcheck="false" autocomplete="off"></label>
+        <button>Open case</button>
+        <p id="err" role="alert" class="bad"></p>
+      </form>
+      <dl id="meta"></dl>
+    </div>
+  </section>
+  <section><h2>Evidence</h2><div id="ev"><p class="dim">No case open. Enter a hostname or IP address above; each probe is logged here as it finishes.</p></div></section>
+  <section><h2>Findings</h2><div id="fi"><p class="dim">Findings are drawn after every probe has finished.</p></div></section>
+  <section><h2>Report</h2><div id="rp"><p class="dim">The case file can be inspected and downloaded once the case closes.</p></div></section>
+</div>
+<script>
+const $ = s => document.querySelector(s);
+const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; };
+const GROUPS = [["confirmed", "Confirmed"], ["hypothesis", "Hypotheses"], ["next", "Next steps"]];
+const FAULTS = new Set(["timeout", "failed", "unavailable"]);
+let current = null, shown = 0, timer;
+
+$('#f').addEventListener('submit', async e => {
+  e.preventDefault(); clearTimeout(timer); $('#err').textContent = '';
+  $('#f button').disabled = true;
+  try {
+    const r = await fetch('/api/cases', {method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({target: $('#t').value, ports: $('#p').value})});
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.error);
+    current = j.id; shown = 0;
+    $('#ev').replaceChildren(); $('#fi').replaceChildren(el('p', 'dim', 'Findings are drawn after every probe has finished.'));
+    $('#rp').replaceChildren(el('p', 'dim', 'The case file can be inspected and downloaded once the case closes.'));
+    poll();
+  } catch (err) { $('#err').textContent = err.message; $('#f button').disabled = false; }
+});
+
+async function poll() {
+  try {
+    const c = await (await fetch('/api/cases/' + current)).json();
+    render(c);
+    if (c.status === 'running') { timer = setTimeout(poll, 600); return; }
+  } catch (err) { $('#err').textContent = 'Lost contact with the local server: ' + err.message; }
+  $('#f button').disabled = false;
+}
+
+function seconds(from, to) { return ((Date.parse(to) - Date.parse(from)) / 1000).toFixed(1); }
+
+function render(c) {
+  const running = c.status === 'running';
+  const status = running ? `running, ${seconds(c.started, new Date().toISOString())} s so far`
+    : c.status === 'done' ? `closed after ${seconds(c.started, c.finished)} s` : `failed: ${c.error}`;
+  const rows = [['Case', c.id], ['Target', c.target], ['Address', c.address || 'none'], ['Opened', c.started.replace('T', ' ').slice(0, 23) + ' UTC'], ['Status', status]];
+  $('#meta').replaceChildren(...rows.flatMap(([k, v]) => { const dd = el('dd', k === 'Status' && c.status === 'error' ? 'bad' : '', v); return [el('dt', null, k), dd]; }));
+
+  for (const o of c.observations.slice(shown)) {
+    const d = el('details', 'row'), s = el('summary');
+    s.append(el('span', null, o.at.slice(11, 23)), el('span', 'pr', o.probe), el('span', FAULTS.has(o.status) ? 'bad' : '', o.status), el('span', 'tx', o.summary), el('span', 'tog'));
+    const raw = `${o.at}  +${seconds(c.started, o.at)} s\n` + (o.command ? `$ ${o.command}\n` : '') + JSON.stringify(o.data, null, 1);
+    d.append(s, el('pre', 'raw', raw));
+    $('#ev').append(d);
+  }
+  shown = c.observations.length;
+  if (!running) { renderFindings(c); renderReport(c); }
+}
+
+function renderFindings(c) {
+  const out = [];
+  for (const [kind, label] of GROUPS) {
+    const items = c.findings.filter(f => f.kind === kind);
+    if (!items.length) continue;
+    const g = el('div', 'grp ' + kind), body = el('div');
+    body.append(...items.map(f => el('p', null, f.text)));
+    g.append(el('div', 'k', label), body); out.push(g);
+  }
+  const lims = c.findings.filter(f => f.kind === 'limitation');
+  if (lims.length) { const d = el('details', 'lim'); d.append(el('summary', null, `Limitations of this investigation (${lims.length})`), ...lims.map(f => el('p', null, f.text))); out.push(d); }
+  $('#fi').replaceChildren(...out);
+}
+
+function renderReport(c) {
+  const url = `/api/cases/${c.id}/report.md`, view = el('button', 'quiet', 'Inspect'), dl = el('a', 'btn', 'Download .md');
+  dl.href = url; view.type = 'button';
+  const pre = el('pre', 'report'); pre.hidden = true;
+  view.onclick = async () => {
+    if (pre.hidden && !pre.textContent) { try { pre.textContent = await (await fetch(url)).text(); } catch (err) { pre.textContent = 'Could not load report: ' + err.message; } }
+    pre.hidden = !pre.hidden; view.textContent = pre.hidden ? 'Inspect' : 'Hide';
+  };
+  const bar = el('div'); bar.style.cssText = 'display:flex;gap:10px;align-items:center';
+  bar.append(view, dl, el('span', 'dim mono', `case-${c.id}.md`));
+  $('#rp').replaceChildren(bar, pre);
+}
+</script>
+</body>
+</html>
